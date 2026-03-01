@@ -1,10 +1,10 @@
 # 🔔 RCI Discord Notifier
 
-Get real-time Discord notifications when your RCI jobs **start**, **finish**, or **crash** — with error logs delivered straight to your channel.
+Real-time Discord notifications when your RCI jobs **start**, **finish**, or **crash** — with error logs delivered straight to your channel.
 
 ---
 
-## What You Get
+## Functionality
 
 | Event | Notification |
 |-------|-------------|
@@ -142,14 +142,20 @@ notify_end $EXIT_CODE
 
 ### Log File Detection
 
-The notifier automatically finds your log files based on SLURM's output pattern:
+The notifier automatically finds your log files regardless of what `--output` / `--error` format you use. It resolves paths using a priority chain:
 
-| Job Type | Expected Pattern |
-|----------|-----------------|
-| Regular | `out/jobname-jobid.out` / `.err` |
-| Array | `out/jobname-arrayjobid_taskid.out` / `.err` |
+1. **`scontrol show job`** — queries SLURM for the fully resolved absolute `StdOut`/`StdErr` paths (most reliable, works with any format)
+2. **`SLURM_STDOUTMODE` / `SLURM_STDERRMODE`** env vars — expands `%` tokens (`%j`, `%x`, `%A`, `%a`, `%u`, `%N`, etc.) as a fallback
+3. **`slurm-%j.out`** — SLURM's own default as a last resort
 
-Make sure your `#SBATCH --output` and `--error` follow this convention.
+This means **any** `--output`/`--error` pattern works (notify us if some does not :DDD):
+
+```bash
+#SBATCH --output=out/%x-%j.out              # ✅ works
+#SBATCH --output=/scratch/%u/logs/%j.log    # ✅ works (absolute path)
+#SBATCH --output=out/%x-%A_%a.out           # ✅ works (array jobs)
+#SBATCH --output=mylog.txt                  # ✅ works (no tokens)
+```
 
 ### Discord Message Limits
 
@@ -165,8 +171,10 @@ Discord messages have a **2000 character limit**. The notifier reserves:
 | Problem | Solution |
 |---------|----------|
 | Start works but end doesn't | Make sure `notify_end $EXIT_CODE` is after capturing `$?`, not inside a pipe |
-| Logs show as empty | Verify your `--output`/`--error` paths match the `out/jobname-jobid.out` pattern |
+| Logs show as empty | Check that your log files exist at the expected path. Run `scontrol show job $SLURM_JOB_ID` to see the resolved `StdOut`/`StdErr` paths |
 | Mentions don't ping | Double-check your `DISCORD_USER_ID` is correct (must be a number) |
+
+Please do not hesitate to contact us in case of any errors :)
 
 ---
 

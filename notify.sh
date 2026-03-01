@@ -7,6 +7,74 @@ DISCORD_WEBHOOK="https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_T
 DISCORD_USER_ID="YOUR_DISCORD_USER_ID"
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Get the already-resolved stdout/stderr paths for the current SLURM job.
+# Priority:
+#   1. scontrol show job  — returns fully expanded absolute paths (most reliable)
+#   2. SLURM_STDOUTMODE / SLURM_STDERRMODE — pattern-based expansion (fallback)
+#   3. SLURM default "slurm-%j.out" — last resort
+#
+# Usage: _get_slurm_log_paths
+#   Sets: _SLURM_STDOUT_PATH  _SLURM_STDERR_PATH
+_get_slurm_log_paths() {
+    _SLURM_STDOUT_PATH=""
+    _SLURM_STDERR_PATH=""
+
+    # ── Method 1: ask scontrol (gives fully resolved absolute paths) ─────
+    if command -v scontrol &>/dev/null && [ -n "$SLURM_JOB_ID" ]; then
+        local job_info
+        job_info=$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null) || true
+        if [ -n "$job_info" ]; then
+            _SLURM_STDOUT_PATH=$(echo "$job_info" | grep -oP 'StdOut=\K\S+' || true)
+            _SLURM_STDERR_PATH=$(echo "$job_info" | grep -oP 'StdErr=\K\S+' || true)
+        fi
+    fi
+
+    # ── Method 2: expand SLURM_STDOUTMODE / SLURM_STDERRMODE patterns ───
+    if [ -z "$_SLURM_STDOUT_PATH" ]; then
+        _SLURM_STDOUT_PATH=$(_resolve_slurm_pattern "${SLURM_STDOUTMODE:-slurm-%j.out}")
+    fi
+    if [ -z "$_SLURM_STDERR_PATH" ]; then
+        _SLURM_STDERR_PATH=$(_resolve_slurm_pattern "${SLURM_STDERRMODE:-slurm-%j.out}")
+    fi
+}
+
+# Resolve a SLURM filename pattern (e.g. "out/%x-%j.out") into the actual
+# file path by expanding all known % tokens.
+# See: https://slurm.schedmd.com/sbatch.html#SECTION_FILENAME-PATTERN
+#
+# Usage: _resolve_slurm_pattern "out/%x-%j.out"
+_resolve_slurm_pattern() {
+    local pattern="$1"
+
+    # If the pattern is empty, return empty
+    [ -z "$pattern" ] && return
+
+    # For array jobs, %j expands to <array_job_id>_<task_id>
+    local effective_job_id="$SLURM_JOB_ID"
+
+    # Perform all standard SLURM substitutions
+    # double-substitution, then replace it at the end.
+    local _pct_placeholder=$'\x01'
+    pattern="${pattern//%%/${_pct_placeholder}}"                        # protect literal %%
+    pattern="${pattern//%A/${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}}"     # array master job id
+    pattern="${pattern//%a/${SLURM_ARRAY_TASK_ID:-0}}"                 # array task id
+    pattern="${pattern//%j/${effective_job_id}}"                        # job id (or arrayjobid_taskid)
+    pattern="${pattern//%J/${effective_job_id}}"                        # same as %j for sbatch
+    pattern="${pattern//%N/${SLURMD_NODENAME:-$(hostname -s)}}"        # short hostname of first node
+    pattern="${pattern//%n/0}"                                         # node id relative to job (0 for sbatch)
+    pattern="${pattern//%t/0}"                                         # task id relative to job (0 for sbatch)
+    pattern="${pattern//%u/${USER:-$(whoami)}}"                        # username
+    pattern="${pattern//%x/${SLURM_JOB_NAME:-batch}}"                  # job name
+    pattern="${pattern//${_pct_placeholder}/%}"                         # restore literal %
+
+    # Make relative paths relative to submit dir
+    if [[ "$pattern" != /* ]]; then
+        pattern="${SLURM_SUBMIT_DIR:-.}/${pattern}"
+    fi
+
+    printf '%s' "$pattern"
+}
+
 _notify() {
     local message="$1"
     # Escape special characters for JSON without jq
@@ -57,15 +125,13 @@ notify_end() {
         array_info=" [task ${SLURM_ARRAY_TASK_ID}]"
     fi
 
-    # Collect last 30 lines of stdout and stderr logs
-    # For array jobs: out/name-jobid_taskid.{out,err}
-    # For regular jobs: out/name-jobid.{out,err}
-    local log_base="${SLURM_SUBMIT_DIR}/out/${SLURM_JOB_NAME}-${SLURM_JOB_ID}"
-    if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
-        log_base="${SLURM_SUBMIT_DIR}/out/${SLURM_JOB_NAME}-${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
-    fi
-    local out_file="${log_base}.out"
-    local err_file="${log_base}.err"
+    # Resolve the actual output/error file paths.
+    # Tries scontrol first (gives absolute resolved paths directly from SLURM),
+    # then falls back to expanding SLURM_STDOUTMODE/SLURM_STDERRMODE patterns,
+    # and finally defaults to "slurm-%j.out".
+    _get_slurm_log_paths
+    local out_file="$_SLURM_STDOUT_PATH"
+    local err_file="$_SLURM_STDERR_PATH"
 
     local log_section=""
     if [ -f "$out_file" ] && [ -s "$out_file" ]; then
@@ -73,7 +139,7 @@ notify_end() {
         out_tail=$(tail -n 30 "$out_file" | head -c 700)
         log_section+=$'\n**stdout (last 30 lines):**\n```\n'"${out_tail}"$'\n```'
     fi
-    if [ -f "$err_file" ] && [ -s "$err_file" ]; then
+    if [ -f "$err_file" ] && [ -s "$err_file" ] && [ "$err_file" != "$out_file" ]; then
         local err_tail
         err_tail=$(tail -n 30 "$err_file" | head -c 900)
         log_section+=$'\n**stderr (last 30 lines):**\n```\n'"${err_tail}"$'\n```'

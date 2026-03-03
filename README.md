@@ -10,7 +10,7 @@ Real-time Discord notifications when your RCI jobs **start**, **finish**, or **c
 |-------|-------------|
 | 🚀 **Job starts** | Job name, ID, partition, node, GPU count, array task info |
 | ✅ **Job succeeds** | Job name, duration, partition, node |
-| ❌ **Job fails** | Job name, duration, exit code, last 30 lines of **stdout** and **stderr** |
+| ❌ **Job fails** | Job name, duration, exit code, last lines of **stdout** and **stderr** |
 
 ### Example Messages
 
@@ -41,11 +41,11 @@ Real-time Discord notifications when your RCI jobs **start**, **finish**, or **c
 ❌ training_run [task 3] failed after 0h 12m 45s
 Exit code: 1
 
-stdout (last 30 lines):
+stdout (last lines):
   Epoch 5/100, Step 847/2000
   Loss: 0.342
 
-stderr (last 30 lines):
+stderr (last lines):
   RuntimeError: CUDA out of memory.
   Tried to allocate 2.00 GiB...
 ```
@@ -138,7 +138,7 @@ notify_end $EXIT_CODE
 - `notify_start` — sends a Discord message with job metadata (ID, partition, node, GPUs, array info)
 - `notify_end $EXIT_CODE` — checks the exit code:
   - **`0`** → sends a ✅ success message with duration
-  - **non-zero** → sends a ❌ failure message with exit code + last 30 lines of both `stdout` and `stderr` log files
+  - **non-zero** → sends a ❌ failure message with exit code + last lines of both `stdout` and `stderr` log files
 
 ### Log File Detection
 

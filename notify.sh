@@ -53,6 +53,7 @@ _resolve_slurm_pattern() {
     local effective_job_id="$SLURM_JOB_ID"
 
     # Perform all standard SLURM substitutions
+    # IMPORTANT: %% must be handled carefully — we use a placeholder to avoid
     # double-substitution, then replace it at the end.
     local _pct_placeholder=$'\x01'
     pattern="${pattern//%%/${_pct_placeholder}}"                        # protect literal %%
@@ -73,6 +74,33 @@ _resolve_slurm_pattern() {
     fi
 
     printf '%s' "$pattern"
+}
+
+# Get the last N lines of a file, but trim from the TOP (removing oldest lines)
+# until the total output fits within a character budget. This ensures we never
+# cut a line in half — we always show complete lines.
+#
+# Usage: _tail_within_chars FILE MAX_LINES MAX_CHARS
+_tail_within_chars() {
+    local file="$1"
+    local max_lines="${2:-30}"
+    local max_chars="${3:-800}"
+
+    local chunk
+    chunk=$(tail -n "$max_lines" "$file")
+
+    # If it already fits, return as-is
+    if [ "${#chunk}" -le "$max_chars" ]; then
+        printf '%s' "$chunk"
+        return
+    fi
+
+    # Drop lines from the top until it fits
+    while [ "${#chunk}" -gt "$max_chars" ] && [ -n "$chunk" ]; do
+        chunk="${chunk#*$'\n'}"
+    done
+
+    printf '%s' "$chunk"
 }
 
 _notify() {
@@ -100,12 +128,22 @@ notify_start() {
         array_info=$'\nArray    : task '"$SLURM_ARRAY_TASK_ID of $SLURM_ARRAY_TASK_MAX"
     fi
 
+    # Resolve log paths so they appear in the start notification
+    _get_slurm_log_paths
+    local log_info=""
+    if [ -n "$_SLURM_STDOUT_PATH" ]; then
+        log_info+=$'\nStdout   : '"$_SLURM_STDOUT_PATH"
+    fi
+    if [ -n "$_SLURM_STDERR_PATH" ] && [ "$_SLURM_STDERR_PATH" != "$_SLURM_STDOUT_PATH" ]; then
+        log_info+=$'\nStderr   : '"$_SLURM_STDERR_PATH"
+    fi
+
     local msg="<@${DISCORD_USER_ID}> 🚀 **${SLURM_JOB_NAME}** started"
     msg+=$'\n```'
     msg+=$'\nJob ID   : '"$SLURM_JOB_ID"
     msg+=$'\nPartition: '"$SLURM_JOB_PARTITION"
     msg+=$'\nNode(s)  : '"$SLURM_JOB_NODELIST"
-    msg+="${gpu_info}${array_info}"
+    msg+="${gpu_info}${array_info}${log_info}"
     msg+=$'\n```'
 
     _notify "$msg"
@@ -114,6 +152,15 @@ notify_start() {
 
 notify_end() {
     local exit_code="$1"
+
+    # Guard: if the caller passed an empty string, no argument, or non-integer,
+    # treat as failure. Common mistake: notify_end $UNSET_VAR → empty string.
+    if [ -z "$exit_code" ]; then
+        exit_code=255
+    elif ! [[ "$exit_code" =~ ^[0-9]+$ ]]; then
+        exit_code=255
+    fi
+
     local runtime=$(( SECONDS - ${_JOB_START_TIME:-0} ))
     local hours=$(( runtime / 3600 ))
     local mins=$(( (runtime % 3600) / 60 ))
@@ -133,16 +180,21 @@ notify_end() {
     local out_file="$_SLURM_STDOUT_PATH"
     local err_file="$_SLURM_STDERR_PATH"
 
+    # Flush filesystem buffers so we read the most up-to-date log content.
+    # SLURM may still be buffering the job's stdout/stderr at this point.
+    sync
+    sleep 10
+
     local log_section=""
     if [ -f "$out_file" ] && [ -s "$out_file" ]; then
         local out_tail
-        out_tail=$(tail -n 30 "$out_file" | head -c 700)
-        log_section+=$'\n**stdout (last 30 lines):**\n```\n'"${out_tail}"$'\n```'
+        out_tail=$(_tail_within_chars "$out_file" 20 700)
+        log_section+=$'\n**stdout (last lines):**\n```\n'"${out_tail}"$'\n```'
     fi
     if [ -f "$err_file" ] && [ -s "$err_file" ] && [ "$err_file" != "$out_file" ]; then
         local err_tail
-        err_tail=$(tail -n 30 "$err_file" | head -c 900)
-        log_section+=$'\n**stderr (last 30 lines):**\n```\n'"${err_tail}"$'\n```'
+        err_tail=$(_tail_within_chars "$err_file" 50 900)
+        log_section+=$'\n**stderr (last lines):**\n```\n'"${err_tail}"$'\n```'
     fi
 
     if [ "$exit_code" -eq 0 ]; then
@@ -151,12 +203,19 @@ notify_end() {
         msg+=$'\nJob ID   : '"$SLURM_JOB_ID"
         msg+=$'\nPartition: '"$SLURM_JOB_PARTITION"
         msg+=$'\nNode(s)  : '"$SLURM_JOB_NODELIST"
+        msg+=$'\nStdout   : '"$out_file"
+        [ "$err_file" != "$out_file" ] && msg+=$'\nStderr   : '"$err_file"
         msg+=$'\n```'
         _notify "$msg"
 
     else
         local msg="<@${DISCORD_USER_ID}> ❌ **${SLURM_JOB_NAME}**${array_info} failed after ${duration}"
         msg+=$'\nExit code: `'"${exit_code}"'`'
+        msg+=$'\n```'
+        msg+=$'\nJob ID   : '"$SLURM_JOB_ID"
+        msg+=$'\nStdout   : '"$out_file"
+        [ "$err_file" != "$out_file" ] && msg+=$'\nStderr   : '"$err_file"
+        msg+=$'\n```'
         msg+="${log_section}"
         _notify "$msg"
     fi

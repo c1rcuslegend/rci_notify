@@ -22,7 +22,9 @@ _get_slurm_log_paths() {
     # ── Method 1: ask scontrol (gives fully resolved absolute paths) ─────
     if command -v scontrol &>/dev/null && [ -n "$SLURM_JOB_ID" ]; then
         local job_info
-        job_info=$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null) || true
+        # timeout: scontrol blocks if slurmctld is busy, which would hang the whole
+        # notification (and thus the job, since this runs at the end).
+        job_info=$(timeout 10 scontrol show job "$SLURM_JOB_ID" 2>/dev/null) || true
         if [ -n "$job_info" ]; then
             _SLURM_STDOUT_PATH=$(echo "$job_info" | grep -oP 'StdOut=\K\S+' || true)
             _SLURM_STDERR_PATH=$(echo "$job_info" | grep -oP 'StdErr=\K\S+' || true)
@@ -86,8 +88,17 @@ _tail_within_chars() {
     local max_lines="${2:-30}"
     local max_chars="${3:-800}"
 
+    # Read a BOUNDED byte window off the end first. `tail -n` alone is not a bound:
+    # tqdm-style progress bars separate updates with \r, not \n, so a single "line"
+    # of an inference log is routinely megabytes. Pulling that into a bash variable
+    # and then doing O(n) string ops on it per iteration is its own hang.
+    # \r -> \n turns each progress redraw into its own line (we want the last few),
+    # and blank lines are dropped so the tail carries actual content.
     local chunk
-    chunk=$(tail -n "$max_lines" "$file")
+    chunk=$(tail -c $(( max_chars * 20 + 4096 )) "$file" 2>/dev/null \
+            | tr '\r' '\n' \
+            | grep -v '^[[:space:]]*$' \
+            | tail -n "$max_lines")
 
     # If it already fits, return as-is
     if [ "${#chunk}" -le "$max_chars" ]; then
@@ -95,9 +106,15 @@ _tail_within_chars() {
         return
     fi
 
-    # Drop lines from the top until it fits
-    while [ "${#chunk}" -gt "$max_chars" ] && [ -n "$chunk" ]; do
-        chunk="${chunk#*$'\n'}"
+    # Drop whole lines from the top until it fits. The old `[ -n "$chunk" ]` guard was
+    # NOT enough: once no newline remains, ${chunk#*\n} is a no-op, so a single
+    # over-budget line spun this loop forever -- eval jobs held a GPU for 11h after
+    # finishing with exit 0, because notify_end never returned. Hard-cut instead.
+    while [ "${#chunk}" -gt "$max_chars" ]; do
+        case "$chunk" in
+            *$'\n'*) chunk="${chunk#*$'\n'}" ;;
+            *)       chunk="${chunk: -$max_chars}"; break ;;
+        esac
     done
 
     printf '%s' "$chunk"
@@ -105,16 +122,33 @@ _tail_within_chars() {
 
 _notify() {
     local message="$1"
+    # The log tail is byte-sliced (tail -c), so it can start mid-UTF-8-character.
+    # Discord rejects the whole payload as malformed JSON if that byte survives,
+    # which silently loses the notification. Drop invalid sequences.
+    if command -v iconv &>/dev/null; then
+        message=$(printf '%s' "$message" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null) || true
+    fi
     # Escape special characters for JSON without jq
     message="${message//\\/\\\\}"   # backslashes
     message="${message//\"/\\\"}"   # double quotes
     message="${message//$'\n'/\\n}" # newlines
     message="${message//$'\r'/\\r}" # carriage returns
     message="${message//$'\t'/\\t}" # tabs
+    # Bounded curl: without a timeout, a slow or unresponsive Discord webhook
+    # makes curl hang indefinitely, so the job never exits after finishing its
+    # work and has to be cancelled by hand. --connect-timeout caps the TCP
+    # connect, --max-time caps the whole request. --retry 2 covers transient
+    # blips (with --retry-connrefused so a refused connection also retries).
+    # Worst case the notification is dropped and the job exits cleanly -- the
+    # right trade: never let a status ping hold a GPU.
     curl -s -o /dev/null \
+         --connect-timeout 10 \
+         --max-time 30 \
+         --retry 2 \
+         --retry-connrefused \
          -H "Content-Type: application/json" \
          -d "{\"content\": \"$message\"}" \
-         "$DISCORD_WEBHOOK"
+         "$DISCORD_WEBHOOK" || true
 }
 
 notify_start() {
@@ -150,7 +184,40 @@ notify_start() {
     export _JOB_START_TIME=$SECONDS
 }
 
+# Watchdog wrapper. notify_end runs at the very end of a job, so ANY hang in it --
+# a bad loop here, a wedged filesystem, a stuck curl -- holds the allocation (and the
+# GPU) until someone notices and scancels it. A status ping is never worth that, so
+# cap the whole thing: run it in the background and SIGKILL it if it overruns.
+# Nothing after notify_end depends on its state, so killing it is safe.
+#
+# Only notify_end is wrapped: notify_start exports _JOB_START_TIME, which would not
+# propagate out of a background subshell. Its steps are individually bounded anyway.
 notify_end() {
+    # `set -m` gives the background impl its OWN process group, so the kill below can
+    # take out the whole tree. Without it, kill -9 $pid reaps only the subshell and
+    # leaves whatever it was blocked on (a stuck curl, a `sync` on a wedged mount)
+    # running. The pgid is fixed at fork time, so job control can be restored at once.
+    local had_monitor=0
+    case "$-" in *m*) had_monitor=1 ;; esac
+    set -m
+    _notify_end_impl "$@" &
+    local pid=$!
+    [ "$had_monitor" -eq 1 ] || set +m
+
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 180 ]; do
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "notify_end: still running after ${waited}s -- killing it so the job can exit" >&2
+        kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
+    fi
+    wait "$pid" 2>/dev/null
+    return 0
+}
+
+_notify_end_impl() {
     local exit_code="$1"
 
     # Guard: if the caller passed an empty string, no argument, or non-integer,
@@ -182,8 +249,12 @@ notify_end() {
 
     # Flush filesystem buffers so we read the most up-to-date log content.
     # SLURM may still be buffering the job's stdout/stderr at this point.
-    sync
-    sleep 10
+    # timeout: a system-wide `sync` can block for many minutes on a busy shared
+    # filesystem (Lustre/NFS), which would hang the job long after its work is done
+    # -- the exact zombie we keep having to scancel. A stale-by-a-few-lines tail in
+    # the Discord message is a fine price for never blocking the job.
+    timeout 10 sync 2>/dev/null || true
+    sleep 2
 
     local log_section=""
     if [ -f "$out_file" ] && [ -s "$out_file" ]; then
